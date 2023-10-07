@@ -15,6 +15,10 @@ import kotlin.properties.Delegates
 
 class VulkanApp {
 
+	private lateinit var graphicsQueue: VkQueue
+
+	private lateinit var device: VkDevice
+
 	private lateinit var physicalDevice: VkPhysicalDevice
 
 	private var debugMessenger by Delegates.notNull<Long>()
@@ -36,10 +40,44 @@ class VulkanApp {
 	private fun initVulkan() {
 		instance = createInstance()
 		setupDebugMessenger()
-		pickPhysicalDevice()
+		physicalDevice = pickPhysicalDevice()
+		createLogicalDevice()
 	}
 
-	private fun pickPhysicalDevice() = MemoryStack.stackPush().use { stack ->
+	private fun createLogicalDevice() = MemoryStack.stackPush().use { stack ->
+
+		val indices = findQueueFamily(physicalDevice)!!
+
+		val queueCreateInfo = VkDeviceQueueCreateInfo.calloc(1, stack)
+		queueCreateInfo.sType(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
+		queueCreateInfo.queueFamilyIndex(indices.graphicsFamily)
+		queueCreateInfo.pQueuePriorities(stack.floats(1f))
+
+		val deviceFeatures = VkPhysicalDeviceFeatures.calloc(stack)
+
+		val createInfo = VkDeviceCreateInfo.calloc(stack)
+		createInfo.sType(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
+		createInfo.pQueueCreateInfos(queueCreateInfo)
+		createInfo.pEnabledFeatures(deviceFeatures)
+
+		// For older vulkan support, newer versions set this implicitly and ignores this
+		if (IS_VALIDATION_ENABLED) {
+			createInfo.ppEnabledLayerNames(validationLayersAsPointerBuffer(stack))
+		}
+
+		val pDevice = stack.pointers(VK_NULL_HANDLE)
+		check(vkCreateDevice(physicalDevice, createInfo, null, pDevice) == VK_SUCCESS) {
+			"Failed to create logical device"
+		}
+
+		device = VkDevice(pDevice[0], physicalDevice, createInfo)
+
+		val pGraphicsQueue = stack.pointers(VK_NULL_HANDLE)
+		vkGetDeviceQueue(device, indices.graphicsFamily, 0, pGraphicsQueue)
+		graphicsQueue = VkQueue(pGraphicsQueue[0], device)
+	}
+
+	private fun pickPhysicalDevice(): VkPhysicalDevice = MemoryStack.stackPush().use { stack ->
 
 		val deviceCount = stack.ints(0)
 
@@ -52,7 +90,7 @@ class VulkanApp {
 		vkEnumeratePhysicalDevices(instance, deviceCount, ppPhysicalDevices)
 
 
-		val physicalDevices = sortedSetOf<ScoredPhysicalDevice>(Collections.reverseOrder())
+		val scoredPhysicalDevices = sortedSetOf<ScoredPhysicalDevice>(Collections.reverseOrder())
 
 		for (i in 0..<ppPhysicalDevices.capacity()) {
 
@@ -68,20 +106,32 @@ class VulkanApp {
 			val properties = VkPhysicalDeviceProperties.malloc(stack)
 			vkGetPhysicalDeviceProperties(device, properties)
 
-			physicalDevices.add(ScoredPhysicalDevice(
+			scoredPhysicalDevices.add(ScoredPhysicalDevice(
 				rateDeviceSuitability(properties, features),
 				device
 			))
 		}
 
-		check(physicalDevices.isNotEmpty()) {
+		check(scoredPhysicalDevices.isNotEmpty()) {
 			"Failed to find suitable GPU"
 		}
 
-		return@use physicalDevices.first()
+		return@use scoredPhysicalDevices.first().physicalDevice
 	}
 
-	private fun isDeviceSuitable(device: VkPhysicalDevice): Boolean = MemoryStack.stackPush().use { stack ->
+	private fun isDeviceSuitable(device: VkPhysicalDevice): Boolean {
+		return findQueueFamily(device) != null
+	}
+
+	private fun validationLayersAsPointerBuffer(stack: MemoryStack): PointerBuffer {
+
+		val buffer = stack.mallocPointer(VALIDATION_LAYERS.size)
+		VALIDATION_LAYERS.map(stack::UTF8).forEach(buffer::put)
+
+		return buffer.rewind()
+	}
+
+	private fun findQueueFamily(device: VkPhysicalDevice): QueueFamilyIndices? = MemoryStack.stackPush().use { stack ->
 
 		// Get queue count on first call
 		val queueFamilyCount = stack.ints(0)
@@ -94,7 +144,7 @@ class VulkanApp {
 			(it.value.queueFlags() and VK_QUEUE_GRAPHICS_BIT) != 0
 		}
 
-		return queueFamily != null
+		return queueFamily?.let { QueueFamilyIndices(it.index) }
 	}
 
 	private fun rateDeviceSuitability(
@@ -160,9 +210,7 @@ class VulkanApp {
 			createInfo.ppEnabledExtensionNames(getRequiredExtensions(stack))
 
 			if (IS_VALIDATION_ENABLED) {
-				val buffer = stack.mallocPointer(VALIDATION_LAYERS.size)
-				VALIDATION_LAYERS.map(stack::UTF8).forEach(buffer::put)
-				createInfo.ppEnabledLayerNames(buffer.rewind())
+				createInfo.ppEnabledLayerNames(validationLayersAsPointerBuffer(stack))
 			}
 			else {
 				createInfo.ppEnabledLayerNames(null)
@@ -199,6 +247,8 @@ class VulkanApp {
 	}
 
 	private fun cleanup() {
+
+		vkDestroyDevice(device, null)
 
 		if (IS_VALIDATION_ENABLED) {
 			destroyDebugUtilsMessengerEXT(instance, debugMessenger, null)
@@ -251,7 +301,7 @@ class VulkanApp {
 
 	companion object {
 
-		val IS_VALIDATION_ENABLED = true
+		const val IS_VALIDATION_ENABLED = true
 
 		val VALIDATION_LAYERS by lazy {
 			setOf("VK_LAYER_KHRONOS_validation")
@@ -286,9 +336,13 @@ class VulkanApp {
 		}
 
 
+		data class QueueFamilyIndices(
+			val graphicsFamily: Int,
+		)
+
 		data class ScoredPhysicalDevice(
 			val score: Int,
-			val physicalDevice: VkPhysicalDevice
+			val physicalDevice: VkPhysicalDevice,
 		) : Comparable<ScoredPhysicalDevice> {
 
 			override fun compareTo(other: ScoredPhysicalDevice): Int {
@@ -296,8 +350,6 @@ class VulkanApp {
 			}
 
 		}
-
-
 	}
 
 }
