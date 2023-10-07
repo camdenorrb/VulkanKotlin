@@ -7,6 +7,8 @@ import org.lwjgl.system.MemoryStack
 import org.lwjgl.system.MemoryUtil.NULL
 import org.lwjgl.vulkan.*
 import org.lwjgl.vulkan.EXTDebugUtils.*
+import org.lwjgl.vulkan.KHRSurface.vkDestroySurfaceKHR
+import org.lwjgl.vulkan.KHRSurface.vkGetPhysicalDeviceSurfaceSupportKHR
 import org.lwjgl.vulkan.VK10.*
 import java.nio.LongBuffer
 import java.util.*
@@ -15,9 +17,14 @@ import kotlin.properties.Delegates
 
 class VulkanApp {
 
+	private lateinit var presentQueue: VkQueue
+
 	private lateinit var graphicsQueue: VkQueue
 
 	private lateinit var device: VkDevice
+
+	private var surface by Delegates.notNull<Long>()
+
 
 	private lateinit var physicalDevice: VkPhysicalDevice
 
@@ -40,24 +47,29 @@ class VulkanApp {
 	private fun initVulkan() {
 		instance = createInstance()
 		setupDebugMessenger()
+		createSurface()
 		physicalDevice = pickPhysicalDevice()
 		createLogicalDevice()
 	}
 
 	private fun createLogicalDevice() = MemoryStack.stackPush().use { stack ->
 
-		val indices = findQueueFamily(physicalDevice)!!
+		val indices = findQueueFamilies(physicalDevice)
+		val uniqueQueueFamilies = indices.unique()
+		val queueCreateInfos = VkDeviceQueueCreateInfo.calloc(uniqueQueueFamilies.size, stack)
 
-		val queueCreateInfo = VkDeviceQueueCreateInfo.calloc(1, stack)
-		queueCreateInfo.sType(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
-		queueCreateInfo.queueFamilyIndex(indices.graphicsFamily)
-		queueCreateInfo.pQueuePriorities(stack.floats(1f))
+		indices.unique().forEachIndexed { index, value ->
+			val queueCreateInfo = queueCreateInfos[index]
+			queueCreateInfo.sType(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
+			queueCreateInfo.queueFamilyIndex(value.toInt())
+			queueCreateInfo.pQueuePriorities(stack.floats(1f))
+		}
 
 		val deviceFeatures = VkPhysicalDeviceFeatures.calloc(stack)
 
 		val createInfo = VkDeviceCreateInfo.calloc(stack)
 		createInfo.sType(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
-		createInfo.pQueueCreateInfos(queueCreateInfo)
+		createInfo.pQueueCreateInfos(queueCreateInfos)
 		createInfo.pEnabledFeatures(deviceFeatures)
 
 		// For older vulkan support, newer versions set this implicitly and ignores this
@@ -72,9 +84,13 @@ class VulkanApp {
 
 		device = VkDevice(pDevice[0], physicalDevice, createInfo)
 
-		val pGraphicsQueue = stack.pointers(VK_NULL_HANDLE)
-		vkGetDeviceQueue(device, indices.graphicsFamily, 0, pGraphicsQueue)
-		graphicsQueue = VkQueue(pGraphicsQueue[0], device)
+		val pQueue = stack.pointers(VK_NULL_HANDLE)
+
+		vkGetDeviceQueue(device, indices.graphicsFamily!!.toInt(), 0, pQueue)
+		graphicsQueue = VkQueue(pQueue[0], device)
+
+		vkGetDeviceQueue(device, indices.presentFamily!!.toInt(), 0, pQueue)
+		presentQueue = VkQueue(pQueue[0], device)
 	}
 
 	private fun pickPhysicalDevice(): VkPhysicalDevice = MemoryStack.stackPush().use { stack ->
@@ -119,8 +135,18 @@ class VulkanApp {
 		return@use scoredPhysicalDevices.first().physicalDevice
 	}
 
+	private fun createSurface() = MemoryStack.stackPush().use { stack ->
+
+		val pSurface = stack.longs(VK_NULL_HANDLE)
+		check(GLFWVulkan.glfwCreateWindowSurface(instance, window, null, pSurface) == VK_SUCCESS) {
+			"Failed to create window surface"
+		}
+
+		surface = pSurface[0]
+	}
+
 	private fun isDeviceSuitable(device: VkPhysicalDevice): Boolean {
-		return findQueueFamily(device) != null
+		return findQueueFamilies(device).isComplete()
 	}
 
 	private fun validationLayersAsPointerBuffer(stack: MemoryStack): PointerBuffer {
@@ -131,7 +157,9 @@ class VulkanApp {
 		return buffer.rewind()
 	}
 
-	private fun findQueueFamily(device: VkPhysicalDevice): QueueFamilyIndices? = MemoryStack.stackPush().use { stack ->
+	private fun findQueueFamilies(device: VkPhysicalDevice): QueueFamilyIndices = MemoryStack.stackPush().use { stack ->
+
+		val indices = QueueFamilyIndices()
 
 		// Get queue count on first call
 		val queueFamilyCount = stack.ints(0)
@@ -140,11 +168,26 @@ class VulkanApp {
 		val queueFamilies = VkQueueFamilyProperties.malloc(queueFamilyCount[0], stack)
 		vkGetPhysicalDeviceQueueFamilyProperties(device, queueFamilyCount, queueFamilies)
 
-		val queueFamily = queueFamilies.withIndex().firstOrNull {
-			(it.value.queueFlags() and VK_QUEUE_GRAPHICS_BIT) != 0
+		val presentSupport = stack.ints(VK_FALSE)
+
+		for (i in 0..<queueFamilies.capacity()) {
+
+			if (indices.isComplete()) {
+				break
+			}
+
+			if (queueFamilies[i].queueFlags() and VK_QUEUE_GRAPHICS_BIT != 0) {
+				indices.graphicsFamily = i.toUInt()
+			}
+
+			vkGetPhysicalDeviceSurfaceSupportKHR(device, i, surface, presentSupport)
+
+			if (presentSupport[0] == VK_TRUE) {
+				indices.presentFamily = i.toUInt()
+			}
 		}
 
-		return queueFamily?.let { QueueFamilyIndices(it.index) }
+		return indices
 	}
 
 	private fun rateDeviceSuitability(
@@ -254,6 +297,7 @@ class VulkanApp {
 			destroyDebugUtilsMessengerEXT(instance, debugMessenger, null)
 		}
 
+		vkDestroySurfaceKHR(instance, surface, null)
 		vkDestroyInstance(instance, null)
 		glfwDestroyWindow(window)
 		glfwTerminate()
@@ -337,8 +381,18 @@ class VulkanApp {
 
 
 		data class QueueFamilyIndices(
-			val graphicsFamily: Int,
-		)
+			var graphicsFamily: UInt? = null,
+			var presentFamily: UInt? = null,
+		) {
+
+			fun isComplete(): Boolean {
+				return graphicsFamily != null && presentFamily != null
+			}
+
+			fun unique(): List<UInt> {
+				return uintArrayOf(graphicsFamily!!, presentFamily!!).distinct()
+			}
+		}
 
 		data class ScoredPhysicalDevice(
 			val score: Int,
