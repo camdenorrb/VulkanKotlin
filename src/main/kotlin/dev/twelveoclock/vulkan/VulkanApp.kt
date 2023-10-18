@@ -7,15 +7,19 @@ import org.lwjgl.system.MemoryStack
 import org.lwjgl.system.MemoryUtil.NULL
 import org.lwjgl.vulkan.*
 import org.lwjgl.vulkan.EXTDebugUtils.*
-import org.lwjgl.vulkan.KHRSurface.vkDestroySurfaceKHR
-import org.lwjgl.vulkan.KHRSurface.vkGetPhysicalDeviceSurfaceSupportKHR
+import org.lwjgl.vulkan.KHRSurface.*
+import org.lwjgl.vulkan.KHRSwapchain.VK_KHR_SWAPCHAIN_EXTENSION_NAME
 import org.lwjgl.vulkan.VK10.*
+import java.nio.IntBuffer
 import java.nio.LongBuffer
 import java.util.*
+import kotlin.collections.HashSet
 import kotlin.properties.Delegates
 
 
 class VulkanApp {
+
+	private var swapChainAdequate = false
 
 	private lateinit var presentQueue: VkQueue
 
@@ -137,7 +141,7 @@ class VulkanApp {
 
 	private fun createSurface() = MemoryStack.stackPush().use { stack ->
 
-		val pSurface = stack.longs(VK_NULL_HANDLE)
+		val pSurface = stack.longs(0)
 		check(GLFWVulkan.glfwCreateWindowSurface(instance, window, null, pSurface) == VK_SUCCESS) {
 			"Failed to create window surface"
 		}
@@ -146,7 +150,40 @@ class VulkanApp {
 	}
 
 	private fun isDeviceSuitable(device: VkPhysicalDevice): Boolean {
-		return findQueueFamilies(device).isComplete()
+
+		val extensionsSupported = checkDeviceExtensionSupport(device)
+
+		if (extensionsSupported) {
+			MemoryStack.stackPush().use { stack ->
+
+				val swapChainSupport = querySwapChainSupport(device)
+
+				swapChainAdequate = swapChainSupport.formats?.hasRemaining() == true &&
+						swapChainSupport.presentModes?.hasRemaining() == true
+			}
+		}
+
+		return findQueueFamilies(device).isComplete() && extensionsSupported && swapChainAdequate
+	}
+
+	private fun chooseSwapSurfaceFormat(availableFormats: VkSurfaceFormatKHR.Buffer): VkSurfaceFormatKHR? {
+		return availableFormats.find {
+			it.format() == VK_FORMAT_B8G8R8A8_SRGB && it.colorSpace() == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+		}
+	}
+
+
+	private fun checkDeviceExtensionSupport(device: VkPhysicalDevice): Boolean = MemoryStack.stackPush().use { stack ->
+
+		val extensionCount = stack.ints(0)
+		vkEnumerateDeviceExtensionProperties(device, null as String?, extensionCount, null)
+
+		val availableExtensions = VkExtensionProperties.malloc(extensionCount[0])
+		vkEnumerateDeviceExtensionProperties(device, null as String?, extensionCount, availableExtensions)
+
+		return availableExtensions
+			.mapTo(HashSet(extensionCount[0]), VkExtensionProperties::extensionNameString)
+			.containsAll(REQUIRED_DEVICE_EXTENSIONS)
 	}
 
 	private fun validationLayersAsPointerBuffer(stack: MemoryStack): PointerBuffer {
@@ -168,7 +205,7 @@ class VulkanApp {
 		val queueFamilies = VkQueueFamilyProperties.malloc(queueFamilyCount[0], stack)
 		vkGetPhysicalDeviceQueueFamilyProperties(device, queueFamilyCount, queueFamilies)
 
-		val presentSupport = stack.ints(VK_FALSE)
+		val presentSupport = stack.ints(0)
 
 		for (i in 0..<queueFamilies.capacity()) {
 
@@ -335,6 +372,34 @@ class VulkanApp {
 		return extensions
 	}
 
+	fun querySwapChainSupport(device: VkPhysicalDevice): SwapChainSupportDetails = MemoryStack.stackPush().use { stack ->
+
+		val capabilities = VkSurfaceCapabilitiesKHR.malloc(stack)
+		vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device, surface, capabilities)
+
+		val details = SwapChainSupportDetails(capabilities)
+
+		val count = stack.ints(0)
+
+		// Format count
+		vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, count, null)
+
+		if (count[0] != 0) {
+			details.formats = VkSurfaceFormatKHR.malloc(count[0], stack)
+			vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, count, details.formats)
+		}
+
+		// Present mode count
+		vkGetPhysicalDeviceSurfacePresentModesKHR(device, surface, count, null)
+		if (count[0] != 0) {
+			details.presentModes = stack.mallocInt(count[0])
+			vkGetPhysicalDeviceSurfacePresentModesKHR(device, surface, count, details.presentModes)
+		}
+
+		return@use details
+	}
+
+
 	private fun populateDebugMessengerCreateInfo(debugCreateInfo: VkDebugUtilsMessengerCreateInfoEXT) {
 		debugCreateInfo.sType(VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT)
 		debugCreateInfo.messageSeverity(VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT or VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT or VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
@@ -351,6 +416,10 @@ class VulkanApp {
 			setOf("VK_LAYER_KHRONOS_validation")
 		}
 
+		val REQUIRED_DEVICE_EXTENSIONS = setOf(
+			VK_KHR_SWAPCHAIN_EXTENSION_NAME
+		)
+
 		fun debugCallback(messageSeverity: Int, messageType: Int, pCallbackData: Long, pUserData: Long): Int {
 
 			val callbackData = VkDebugUtilsMessengerCallbackDataEXT.create(pCallbackData)
@@ -361,8 +430,10 @@ class VulkanApp {
 		}
 
 		private fun createDebugUtilsMessengerEXT(
-			instance: VkInstance, createInfo: VkDebugUtilsMessengerCreateInfoEXT,
-			allocationCallbacks: VkAllocationCallbacks?, pDebugMessenger: LongBuffer,
+			instance: VkInstance,
+			createInfo: VkDebugUtilsMessengerCreateInfoEXT,
+			allocationCallbacks: VkAllocationCallbacks?,
+			pDebugMessenger: LongBuffer,
 		): Int {
 			return if (vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT") != NULL) {
 				vkCreateDebugUtilsMessengerEXT(instance, createInfo, allocationCallbacks, pDebugMessenger)
@@ -379,6 +450,11 @@ class VulkanApp {
 			}
 		}
 
+		data class SwapChainSupportDetails(
+			val capabilities: VkSurfaceCapabilitiesKHR,
+			var formats: VkSurfaceFormatKHR.Buffer? = null,
+			var presentModes: IntBuffer? = null,
+		)
 
 		data class QueueFamilyIndices(
 			var graphicsFamily: UInt? = null,
